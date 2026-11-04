@@ -2,7 +2,7 @@
 // Bump VERSION on every deploy (keep it equal to js/version.js). A new
 // VERSION makes this file byte-different, so the browser installs the new
 // worker; the page then shows "Update available. Tap to refresh".
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const CACHE = `lean-split-v${VERSION}`;
 
 // The whole app shell. Relative URLs resolve against this file, so the

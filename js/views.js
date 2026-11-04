@@ -1,9 +1,9 @@
 // views.js: screens rendered as HTML strings. Event handling lives in app.js
 // (elements carry data-act="…" attributes).
-import { state, ctx, estimateFor, backupAgeDays, hasData, swapOptions } from './state.js';
-import { PROGRAMS, getDay, dayName, slotsFor, setsFor, buildBlocks, blockRest, finisherFor, phase, weekRir, cardioCap, isDeload, exercise, EQUIPMENT } from './program.js';
+import { state, ctx, estimateFor, backupAgeDays, hasData, swapOptions, staleActive, blockRestFor, endTimeFor } from './state.js';
+import { PROGRAMS, getDay, dayName, slotsFor, setsFor, buildBlocks, finisherFor, phase, weekRir, cardioCap, isDeload, exercise, EQUIPMENT, estimateRange } from './program.js';
 import { esc, fmtDate, fmtNum, fmtClock, fmtRest, fmtTime, addDays, mondayOf, weekdayIndex, WEEKDAYS, isStandalone } from './util.js';
-import { lastPerformance, progressionHint, warmupRamp, findPRs, topSet, rollingAverage, weeklyChange, cardioMinutes, sessionsBetween, setsDone, setsPlanned, weeklySummaries, liftTrend, nextInRotation } from './stats.js';
+import { lastPerformance, progressionHint, warmupRamp, findPRs, topSet, rollingAverage, weeklyChange, cardioMinutes, sessionsBetween, setsDone, setsPlanned, weeklySummaries, liftTrend, nextInRotation, durationMin, lastActivity } from './stats.js';
 import { lineChart } from './charts.js';
 import { APP_VERSION } from './version.js';
 
@@ -65,8 +65,8 @@ function todayChoice(c) {
   const next = nextInRotation(state.sessions, rot);
   if (ui.pickDay && rot.includes(ui.pickDay)) return { dayId: ui.pickDay, reason: 'picked', next };
   if (state.settings.scheduleMode === 'rotation') return { dayId: next, reason: 'rotation', next };
-  const sched = state.settings.schedule[state.settings.programId][weekdayIndex(c.today)];
-  if (sched) return { dayId: sched, reason: 'scheduled', next };
+  const sched = (state.settings.schedule[state.settings.programId] || [])[weekdayIndex(c.today)];
+  if (sched && rot.includes(sched)) return { dayId: sched, reason: 'scheduled', next };
   return { dayId: null, reason: 'rest', next };
 }
 
@@ -94,11 +94,14 @@ export function viewToday() {
     html += `<p class="note-line">Next week is a deload week: lighter on purpose.</p>`;
   }
 
+  const stale = staleActive();
   const doneToday = state.sessions.filter((x) => x.finishedAt && x.date === c.today);
-  if (doneToday.length && !ui.pickDay) {
+  if (stale) {
+    html += staleCard(stale);
+  } else if (doneToday.length && !ui.pickDay) {
     const last = doneToday[doneToday.length - 1];
     html += `<section class="card done-card" data-testid="done-today"><h2>Done for today</h2>
-      <p class="big-num">${esc(last.dayName)} · ${Math.round((last.finishedAt - last.startedAt) / 60000)} min · ${setsDone(last)} sets</p>
+      <p class="big-num">${esc(last.dayName)} · ${durationMin(last)} min · ${setsDone(last)} sets</p>
       <p>Nice work. Eat, rest and sleep well.</p>
       <div class="row"><a class="btn ghost" href="#summary/${esc(last.id)}">See summary</a><button class="ghost" data-act="pick" data-day="${esc(todayChoice(c).next)}">Train again</button></div></section>`;
   } else {
@@ -134,9 +137,21 @@ export function viewToday() {
 
   const age = backupAgeDays(c.today);
   if (hasData() && (age === null || age >= 14)) {
-    html += `<p class="note-line">${age === null ? 'No backup yet.' : `Last backup ${age} days ago.`} <a href="#plan-backup">Export one</a>: it takes a few seconds.</p>`;
+    html += `<div class="note-row"><span class="note-line">${age === null ? 'No backup yet.' : `Last backup ${age} days ago.`} It takes a few seconds.</span><a class="btn ghost" href="#plan-backup" data-testid="backup-nudge">Export</a></div>`;
   }
   return html;
+}
+
+function staleCard(A) {
+  const done = A.exercises.reduce((a, e) => a + (e.skipped ? 0 : e.sets.filter((x) => x.done).length), 0);
+  const last = lastActivity(A);
+  const end = endTimeFor(A);
+  return `<section class="card banner stale" data-testid="stale-card">
+    <h2>Unfinished workout from ${esc(fmtDate(A.date))}</h2>
+    <p>${esc(A.dayName)} · ${done} set${done === 1 ? '' : 's'} ticked${done ? `, the last one at ${fmtTime(last)}` : ''}.</p>
+    <p class="muted small">${done ? `Save as finished records it as ${Math.max(1, Math.round((end - A.startedAt) / 60000))} min, ending after the last ticked set and its rest.` : 'Nothing was ticked, so there is nothing to save.'} Then today’s session appears here.</p>
+    <div class="row">${done ? `<button class="primary" data-act="stale-save" data-testid="stale-save">Save as finished</button>` : ''}
+      <button class="ghost danger" data-act="discard" data-testid="stale-discard">Discard</button></div></section>`;
 }
 
 function sessionCard(ch, mode, c) {
@@ -189,10 +204,7 @@ export function workoutBlocks(A) {
   });
   return blocks;
 }
-export function restForBlock(A, idx) {
-  const items = idx.map((i) => A.exercises[i]).filter((e) => !e.skipped);
-  return blockRest(items.length ? items : idx.map((i) => A.exercises[i]), state.settings.restOverride);
-}
+export const restForBlock = blockRestFor;
 
 export function viewWorkout() {
   const A = state.active;
@@ -201,7 +213,7 @@ export function viewWorkout() {
   let html = `<header class="wk-head" data-testid="workout-head">
     <div class="wk-title"><b>${esc(A.dayName)}</b> <span class="muted">${A.mode === 'short' ? 'Short' : 'Full'} · week ${A.week}${A.deload ? ' · deload' : ''}</span></div>
     <div class="wk-stats"><span class="clock" id="wk-clock" data-testid="clock">${fmtClock(Date.now() - A.startedAt)}</span>
-      <span class="muted small" id="wk-eta">planned ≈${A.estimateMin} min · ends ~${fmtTime(A.startedAt + A.estimateMin * 60000)}</span>
+      <span class="muted small" id="wk-eta">planned ≈${A.estimateMin ?? '–'} min · ends ~${fmtTime(A.startedAt + (A.estimateMin || 60) * 60000)}</span>
       <span class="muted small"><span data-testid="sets-done">${done}</span>/${total} sets</span>
       <span class="mini-rest" id="mini-rest" hidden></span></div>
   </header>`;
@@ -235,15 +247,15 @@ function exerciseCard(A, i, label, rest, isSS) {
   const ramp = e.rampUp && !A.deload ? warmupRamp(e.sets[0]?.kg, step) : null;
   const rows = e.sets.map((st, j) => `<div class="set-row ${st.done ? 'done' : ''}" data-testid="set-${i}-${j}">
       <span class="n">${j + 1}</span>
-      <input class="kg" inputmode="decimal" autocomplete="off" enterkeyhint="next" aria-label="kg set ${j + 1}" placeholder="–" data-field="kg" data-ex="${i}" data-set="${j}" value="${st.kg ?? ''}">
+      <input class="kg" inputmode="decimal" autocomplete="off" enterkeyhint="next" aria-label="kg set ${j + 1}" placeholder="kg" data-field="kg" data-ex="${i}" data-set="${j}" value="${st.kg == null ? '' : fmtNum(st.kg, 2)}">
       <span class="x">kg ×</span>
-      <input class="reps" inputmode="numeric" autocomplete="off" enterkeyhint="done" aria-label="reps set ${j + 1}" placeholder="${e.reps[1]}" data-field="reps" data-ex="${i}" data-set="${j}" value="${st.reps ?? ''}">
+      <input class="reps" inputmode="numeric" autocomplete="off" enterkeyhint="done" aria-label="reps set ${j + 1}" placeholder="reps" data-field="reps" data-ex="${i}" data-set="${j}" value="${st.reps ?? ''}">
       <button class="check ${st.done ? 'on' : ''}" data-act="check" data-ex="${i}" data-set="${j}" aria-label="Set ${j + 1} done" data-testid="check-${i}-${j}">✓</button>
     </div>`).join('');
   return `<article class="ex-card" data-testid="ex-${i}" data-exid="${esc(e.exId)}">
     <div class="ex-head">${label ? `<span class="tag">${esc(label)}</span>` : ''}<div><h3>${esc(e.nameEn)}</h3><p class="es">${esc(e.nameEs)}</p></div></div>
     <p class="meta">${esc(e.muscles.join(', '))} · <b>${e.sets.length}×${e.reps[0]}–${e.reps[1]}${e.perSide ? ' per leg' : ''}</b> · <span class="rir-chip">RIR ${esc(e.rir)}</span> · rest ${fmtRest(rest)}${isSS ? ' after the pair' : ''}</p>
-    ${last ? `<p class="last">Last time (${esc(fmtDate(last.date, false))}): ${last.sets.map((x) => `${fmtNum(x.kg)}×${x.reps}`).join(' · ')}</p>` : ''}
+    ${last ? `<p class="last">Last time (${esc(fmtDate(last.date, false))}): ${last.sets.map((x) => `${fmtNum(x.kg)}×${x.reps}`).join(' · ')}</p>` : `<p class="last">First time: enter kg and reps, then tap ✓. Aim for ${e.reps[0]}–${e.reps[1]} reps.</p>`}
     <p class="hint tone-${hint.tone}" data-testid="hint-${i}">${esc(hint.text)}${hint.addKg && !e.applied && !e.sets.some((x) => x.done) ? ` <button class="mini" data-act="apply" data-ex="${i}" data-kg="${hint.addKg}">Apply</button>` : ''}</p>
     ${ramp ? `<p class="ramp">Warm-up sets: ${ramp.map((r) => `${fmtNum(r.kg)}×${r.reps}`).join(' · ')}</p>` : ''}
     <div class="sets">${rows}</div>
@@ -259,7 +271,7 @@ function exerciseCard(A, i, label, rest, isSS) {
 
 export function swapModal(i) {
   const e = state.active.exercises[i];
-  const opts = swapOptions(e.baseExId);
+  const opts = swapOptions(e);
   return `<h2>Swap ${esc(e.nameEn)}</h2><p class="muted small">Same movement pattern and stretch position. Keep a swap for 4–6 weeks so you can track progress.</p>
     <div class="stack">${opts.map((id) => { const x = exercise(id); return `<button class="${id === e.exId ? 'primary' : 'ghost'} wide left" data-m="swap" data-val="${id}"><b>${esc(x.nameEn)}</b><br><span class="es">${esc(x.nameEs)}${id === e.baseExId ? ' · in the plan' : ''}</span></button>`; }).join('')}</div>
     <label class="check-line"><input type="checkbox" id="swap-remember" checked> Remember for the next 6 weeks</label>
@@ -278,11 +290,11 @@ export function noteModal(i) {
 export function viewSummary(id) {
   const S = state.sessions.find((s) => s.id === id);
   if (!S) return head('Summary') + `<p class="muted">Workout not found.</p>`;
-  const dur = Math.round((S.finishedAt - S.startedAt) / 60000);
+  const dur = durationMin(S);
   const prs = findPRs(S, state.sessions);
   const tops = S.exercises.filter((e) => !e.skipped && e.sets.some((x) => x.done)).map((e) => {
-    const t = topSet(e.sets.filter((x) => x.done));
-    return `<li><span>${esc(e.nameEn)}</span><b>${fmtNum(t.kg)} kg × ${t.reps}</b></li>`;
+    const t = topSet(e.sets.filter((x) => x.done)) || {};
+    return `<li><span>${esc(e.nameEn)}</span><b>${fmtNum(t.kg)} kg × ${t.reps ?? '–'}</b></li>`;
   }).join('');
   const fin = finisherFor({ leg: S.leg }, S.mode, S.deload);
   const logged = state.cardio.find((c) => c.sessionId === S.id);
@@ -314,7 +326,7 @@ export function viewLog() {
   const c = ctx();
   const recentCardio = [...state.cardio].sort((a, b) => (a.date === b.date ? b.createdAt - a.createdAt : a.date < b.date ? 1 : -1)).slice(0, 12);
   const wc = weeklyChange(state.body, c.today);
-  const ra = rollingAverage(state.body);
+  const ra = rollingAverage(state.body, c.today);
   const latest = ra[ra.length - 1];
   const weights = ra.slice(-10).reverse();
   const waists = state.body.filter((b) => typeof b.waistCm === 'number').sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 6);
@@ -325,7 +337,7 @@ export function viewLog() {
         <label>Type<select name="c-type"><option>Incline walk</option><option>Walk</option><option>Bike</option><option>Other</option></select></label>
         <label>When<select name="c-kind"><option value="am-walk">Morning walk</option><option value="finisher">Finisher</option><option value="other">Other</option></select></label>
       </div>
-      <label>Date<input type="date" name="c-date" value="${c.today}"></label>
+      <label>Date<input type="date" name="c-date" value="${c.today}" max="${c.today}"></label>
       ${cardioFields('c-', { minutes: '', speed: '5.5', incline: '6' })}
       ${talkButtons('c-talk')}
       <button class="primary wide" data-act="cardio-save" data-testid="cardio-save">Save cardio</button>
@@ -336,7 +348,7 @@ export function viewLog() {
   <section class="card" id="log-weight"><h2>Body weight</h2>
     <p class="muted small">3–4 morning weigh-ins a week, same routine. The 7-day average matters, not single days.</p>
     <form data-form="weight" class="grid2 align-end" data-testid="weight-form">
-      <label>Date<input type="date" name="bw-date" value="${c.today}"></label>
+      <label>Date<input type="date" name="bw-date" value="${c.today}" max="${c.today}"></label>
       <label>Weight kg<input name="bw-kg" inputmode="decimal" autocomplete="off" placeholder="e.g. 80,4" data-testid="bw-kg"></label>
       <button class="primary wide span2" data-act="weight-save" data-testid="weight-save">Save weight</button>
     </form>
@@ -351,7 +363,7 @@ export function viewLog() {
   <section class="card" id="log-waist"><h2>Waist <span class="muted small">(optional, weekly)</span></h2>
     <p class="muted small">Once a week, at the navel, same morning routine.</p>
     <form data-form="waist" class="grid2 align-end">
-      <label>Date<input type="date" name="w-date" value="${c.today}"></label>
+      <label>Date<input type="date" name="w-date" value="${c.today}" max="${c.today}"></label>
       <label>Waist cm<input name="w-cm" inputmode="decimal" autocomplete="off" placeholder="e.g. 88,5" data-testid="waist-cm"></label>
       <button class="primary wide span2" data-act="waist-save" data-testid="waist-save">Save waist</button>
     </form>
@@ -367,7 +379,7 @@ const TREND_LIFTS = ['bench', 'squat', 'rdl', 'incline-db-press', 'hip-thrust', 
 export function viewHistory() {
   const c = ctx();
   const weeks = weeklySummaries(state, c.today, 8);
-  const ra = rollingAverage(state.body);
+  const ra = rollingAverage(state.body, c.today);
   const sessions = state.sessions.filter((s) => s.finishedAt).sort((a, b) => b.startedAt - a.startedAt);
   const bwChart = lineChart({ label: 'Body weight', unit: 'kg', series: [
     { points: ra.map((r) => ({ date: r.date, y: r.kg })), cls: 'raw', dots: true, line: false },
@@ -382,14 +394,14 @@ export function viewHistory() {
   <section class="card" data-testid="lift-charts"><h2>Top sets</h2><p class="muted small">Heaviest set per workout. Slow and steady is the goal while you lose fat.</p>
     ${trends.length ? trends.map((t) => { const l = t.pts[t.pts.length - 1]; return `<div class="trend"><p class="row between"><b>${esc(exercise(t.id).nameEn)}</b><span class="muted small">latest ${fmtNum(l.y)} kg × ${l.reps}</span></p>${lineChart({ label: exercise(t.id).nameEn, series: [{ points: t.pts, cls: 'lift', dots: true }], height: 120 })}</div>`; }).join('') : '<p class="muted small">Charts appear after two workouts with the same lift.</p>'}
   </section>
-  <section class="card"><h2>Workouts</h2><ul class="entries" data-testid="session-list">${sessions.map((s) => `<li><a class="row-link" href="#session/${esc(s.id)}"><span>${esc(fmtDate(s.date))} · <b>${esc(s.dayName)}</b><br><small class="muted">${s.mode === 'short' ? 'Short' : 'Full'} · ${Math.round((s.finishedAt - s.startedAt) / 60000)} min · ${setsDone(s)} sets${s.deload ? ' · deload' : ''}</small></span><span aria-hidden="true">›</span></a></li>`).join('') || '<li class="muted">No workouts yet.</li>'}</ul></section>`;
+  <section class="card"><h2>Workouts</h2><ul class="entries" data-testid="session-list">${sessions.map((s) => `<li><a class="row-link" href="#session/${esc(s.id)}"><span>${esc(fmtDate(s.date))} · <b>${esc(s.dayName)}</b><br><small class="muted">${s.mode === 'short' ? 'Short' : 'Full'} · ${durationMin(s)} min · ${setsDone(s)} sets${s.deload ? ' · deload' : ''}</small></span><span aria-hidden="true">›</span></a></li>`).join('') || '<li class="muted">No workouts yet.</li>'}</ul></section>`;
 }
 
 export function viewSession(id) {
   const S = state.sessions.find((s) => s.id === id);
   if (!S) return head('Workout') + `<p class="muted">Not found.</p>`;
   const cardio = state.cardio.filter((x) => x.sessionId === S.id);
-  return head(S.dayName, `${esc(fmtDate(S.date))} · week ${S.week} · ${S.mode === 'short' ? 'Short' : 'Full'} · ${Math.round((S.finishedAt - S.startedAt) / 60000)} min`) + `
+  return head(S.dayName, `${esc(fmtDate(S.date))} · week ${S.week} · ${S.mode === 'short' ? 'Short' : 'Full'} · ${durationMin(S)} min`) + `
     <section class="card" data-testid="session-detail">${S.exercises.map((e) => `<div class="det-ex"><p><b>${esc(e.nameEn)}</b> <span class="es">${esc(e.nameEs)}</span></p>
       ${e.skipped ? '<p class="muted small">Skipped</p>' : `<p class="small">${e.sets.filter((x) => x.done).map((x) => `${fmtNum(x.kg)}×${x.reps}`).join(' · ') || '<span class="muted">no sets</span>'} <span class="muted">· RIR ${esc(e.rir)}</span></p>`}
       ${e.note ? `<p class="ex-note">Note: ${esc(e.note)}</p>` : ''}</div>`).join('')}
@@ -424,7 +436,8 @@ export function viewPlan() {
     <p class="muted small">${s.scheduleMode === 'rotation' ? 'Today always shows the session after the last one you did. Missed days just shift.' : 'Missed a day? On a rest day, “Train anyway” picks up the next session in the rotation.'}</p>
     ${s.scheduleMode === 'fixed' ? `<div class="sched">${WEEKDAYS.map((wd, i) => `<label>${wd}<select data-sched="${i}">${dayOpts(sched[i])}</select></label>`).join('')}</div>` : ''}
     <p class="label">Default day length</p>
-    <div class="seg"><button class="${s.dayMode === 'full' ? 'on' : ''}" data-act="set" data-key="dayMode" data-val="full">Full (~60 min)</button><button class="${s.dayMode === 'short' ? 'on' : ''}" data-act="set" data-key="dayMode" data-val="short">Short (~45 min)</button></div>
+    <div class="seg"><button class="${s.dayMode === 'full' ? 'on' : ''}" data-act="set" data-key="dayMode" data-val="full" data-testid="daymode-full">Full ≈${estimateRange(s.programId, { mode: 'full', week: c.w, deload: c.deload, restOverride: s.restOverride })} min</button><button class="${s.dayMode === 'short' ? 'on' : ''}" data-act="set" data-key="dayMode" data-val="short" data-testid="daymode-short">Short ≈${estimateRange(s.programId, { mode: 'short', week: c.w, deload: c.deload, restOverride: s.restOverride })} min</button></div>
+    <p class="muted small">Estimates for this program week, including warm-up and finisher.</p>
     <label>Deload every<select data-setting="deloadEvery">${[6, 7, 8, 9].map((n) => `<option value="${n}" ${n === Number(s.deloadEvery) ? 'selected' : ''}>${n} weeks (week ${n}, ${n * 2}, …)</option>`).join('')}</select></label>
     <button class="ghost wide" data-act="deload-toggle" data-testid="deload-toggle">${c.deload ? 'End the deload this week' : 'Make this week a deload'}</button>
     <p class="muted small">Deload sooner if lifts stall 2 sessions in a row or joints ache: about half the sets at RIR 3–4, cardio a third less. Don’t stop completely.</p>

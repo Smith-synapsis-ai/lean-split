@@ -1,11 +1,11 @@
 // app.js: boot, router, event handling, workout flow, rest timer UI,
 // backup and service-worker updates.
-import { state, store, initState, ctx, saveSettings, saveMeta, saveActive, newWorkout, exportData, validateBackup, importData, resetAll } from './state.js';
+import { state, store, initState, ctx, saveSettings, saveMeta, saveActive, newWorkout, exportData, validateBackup, importData, resetAll, staleActive, endTimeFor } from './state.js';
 import { ui, viewToday, viewWorkout, viewSummary, viewLog, viewHistory, viewSession, viewPlan, swapModal, noteModal, workoutBlocks, restForBlock } from './views.js';
 import { exercise } from './program.js';
 import { RestTimer, unlockAudio, beep, keepAwake } from './timer.js';
 import { lastPerformance } from './stats.js';
-import { esc, isoDate, parseDecimal, parseIntSafe, fmtClock, fmtTime, uid } from './util.js';
+import { esc, isoDate, parseDecimal, parseIntSafe, fmtClock, fmtTime, uid, isISODate } from './util.js';
 
 const $ = (sel) => document.querySelector(sel);
 const main = $('#view');
@@ -13,6 +13,8 @@ let timer = null;
 let swReg = null;
 let userAskedUpdate = false;
 let lastRouteKey = '';
+let lastCheckTap = 0;
+let lastCheckKey = '';
 let restDoneUntil = 0;
 
 /* ================================================================== */
@@ -26,7 +28,7 @@ async function boot() {
     return;
   }
   timer = new RestTimer({ onTick: updateRestUI, onDone: restDone });
-  if (state.active) {
+  if (state.active && !staleActive()) {
     if (state.active.rest) timer.restore(state.active.rest.endsAt, state.active.rest.total, state.active.rest.label);
     keepAwake(true);
   }
@@ -49,9 +51,13 @@ function go(hash) {
   else location.hash = hash;
 }
 
+/** Is the live workout screen showing? (an unfinished but stale workout is not) */
+const liveWorkout = () => !!state.active && !staleActive();
+
 function render() {
   const { name, arg } = route();
   let html, tab = name, anchor = null;
+  try {
   switch (name) {
     case 'summary': html = viewSummary(arg); tab = 'today'; break;
     case 'log': html = viewLog(); break;
@@ -59,31 +65,40 @@ function render() {
     case 'session': html = viewSession(arg); tab = 'history'; break;
     case 'plan': case 'plan-backup': case 'plan-install':
       html = viewPlan(); tab = 'plan'; anchor = name === 'plan' ? null : name; break;
-    default: html = state.active ? viewWorkout() : viewToday(); tab = 'today';
+    default: html = liveWorkout() ? viewWorkout() : viewToday(); tab = 'today';
   }
-  const key = `${name}/${arg}/${state.active ? 'w' : ''}`;
+  } catch (e) {
+    // Never leave the app stuck on "Loading…": show a recovery card instead.
+    console.error('render failed', e);
+    html = `<header class="top"><h1>Something looks off</h1></header><section class="card" data-testid="render-error">
+      <p>This screen could not be shown, probably because of unexpected data. Your other screens and data are still there.</p>
+      <div class="row"><a class="btn ghost" href="#plan-backup">Backup / import</a><a class="btn ghost" href="#history">History</a></div></section>`;
+  }
+  const key = `${name}/${arg}/${liveWorkout() ? 'w' : ''}`;
   const y = window.scrollY;
   main.innerHTML = html;
-  document.body.dataset.view = tab === 'today' && state.active && name !== 'summary' ? 'workout' : name;
+  document.body.dataset.view = tab === 'today' && liveWorkout() && name !== 'summary' ? 'workout' : name;
   document.querySelectorAll('#tabbar a').forEach((a) => {
     const on = a.dataset.tab === tab;
     a.classList.toggle('on', on);
     if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   });
   const tLabel = $('#tab-today-label');
-  if (tLabel) tLabel.textContent = state.active ? 'Workout' : 'Today';
-  $('#tabbar a[data-tab="today"]')?.classList.toggle('live', !!state.active);
+  if (tLabel) tLabel.textContent = liveWorkout() ? 'Workout' : 'Today';
+  $('#tabbar a[data-tab="today"]')?.classList.toggle('live', liveWorkout());
   if (key === lastRouteKey) window.scrollTo(0, y);
   else if (anchor && document.getElementById(anchor)) document.getElementById(anchor).scrollIntoView();
   else window.scrollTo(0, 0);
   lastRouteKey = key;
   updateRestUI();
+  syncKb(); // the focused field may just have been replaced
 }
 
 /* ================================================================== */
 /* Small UI helpers: toast and modal                                    */
 /* ================================================================== */
 let toastTimer = null;
+function hideToast() { clearTimeout(toastTimer); const t = $('#toast'); if (t) t.hidden = true; }
 function toast(msg) {
   const t = $('#toast');
   t.textContent = msg; t.hidden = false;
@@ -130,14 +145,34 @@ function bindEvents() {
   });
   document.addEventListener('change', (e) => Promise.resolve(onChange(e)).catch(showError));
   document.addEventListener('input', onInput);
-  // Hide the bottom bars while the keyboard is up (iOS resizes the visual viewport).
-  document.addEventListener('focusin', (e) => { if (isTextInput(e.target)) document.body.classList.add('kb'); });
-  document.addEventListener('focusout', () => setTimeout(() => { if (!isTextInput(document.activeElement)) document.body.classList.remove('kb'); }, 80));
+  // Hide the bottom bars only while a real keyboard is up. The state is
+  // recomputed from scratch on every relevant event (never just toggled),
+  // because WebKit fires no focusout when a focused field is removed by a
+  // re-render (QA finding 1: the tab bar vanished after picking a date).
+  document.addEventListener('focusin', syncKb);
+  document.addEventListener('focusout', () => setTimeout(syncKb, 80));
+  document.addEventListener('change', () => setTimeout(syncKb, 0), true);
+  document.addEventListener('blur', () => setTimeout(syncKb, 80), true);
+  window.addEventListener('pageshow', syncKb);
+  window.addEventListener('resize', syncKb);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', syncKb);
+  setInterval(syncKb, 1500); // watchdog: never leave the tab bar hidden
   // Save promptly when the app goes to the background.
   document.addEventListener('visibilitychange', () => { if (document.hidden && state.active) saveActive(); });
   window.addEventListener('pagehide', () => { if (state.active) saveActive(); });
 }
-const isTextInput = (el) => el && ((el.tagName === 'INPUT' && !['checkbox', 'file', 'hidden', 'radio'].includes(el.type)) || el.tagName === 'TEXTAREA');
+// Fields that bring up a typing keyboard. Date pickers and selects don't.
+const isTextInput = (el) => !!el && el.isConnected && ((el.tagName === 'INPUT' && ['text', 'search', 'email', 'tel', 'url', 'password', 'number'].includes(el.type)) || el.tagName === 'TEXTAREA');
+/** Keyboard open = a text field is focused AND the visual viewport has shrunk.
+ *  (window.__lsFakeKeyboard lets the automated tests simulate the keyboard.) */
+function keyboardUp() {
+  if (typeof window.__lsFakeKeyboard === 'boolean') return window.__lsFakeKeyboard;
+  const vv = window.visualViewport;
+  return vv ? vv.height < window.innerHeight - 120 : true;
+}
+function syncKb() {
+  document.body.classList.toggle('kb', isTextInput(document.activeElement) && keyboardUp());
+}
 function showError(e) { console.error(e); toast('Something went wrong. Your data is safe.'); }
 
 function formVal(form, name) { const el = form.elements[name]; return el ? el.value : ''; }
@@ -147,7 +182,16 @@ function readCardio(form, prefix) {
   const incline = parseDecimal(formVal(form, `${prefix}incline`));
   if (!minutes || Number.isNaN(minutes) || minutes <= 0 || minutes > 300) { toast('Enter the minutes (1–300).'); return null; }
   if (Number.isNaN(speed) || Number.isNaN(incline)) { toast('Speed and incline must be numbers, e.g. 5,5'); return null; }
+  if (speed !== null && (speed < 1 || speed > 25)) { toast('Speed should be between 1 and 25 km/h.'); return null; }
+  if (incline !== null && (incline < 0 || incline > 20)) { toast('Incline should be between 0 and 20 %.'); return null; }
   return { minutes, speed: speed ?? null, incline: incline ?? null, talk: formVal(form, `${prefix}talk`) || 'talk' };
+}
+/** Date from a form field: must be a real date, not in the future. */
+function pastDate(v) {
+  const d = v || isoDate();
+  if (!isISODate(d)) { toast('Pick a valid date.'); return null; }
+  if (d > isoDate()) { toast('That date is in the future. Pick today or an earlier day.'); return null; }
+  return d;
 }
 async function addCardio(entry) {
   const c = { id: uid('c'), createdAt: Date.now(), date: isoDate(), type: 'Incline walk', ...entry };
@@ -191,8 +235,19 @@ const actions = {
   check: async (el) => {
     const A = state.active; const i = +el.dataset.ex, j = +el.dataset.set;
     const e = A.exercises[i], st = e.sets[j];
+    // Debounce: a second tap on the same set within 700 ms (double tap,
+    // sweaty finger) is ignored. Different sets can be ticked quickly.
+    const now = Date.now(), key = `${i}-${j}`;
+    if (key === lastCheckKey && now - lastCheckTap < 700) return;
+    lastCheckTap = now; lastCheckKey = key;
     unlockAudio(state.settings.soundOverSilent);
-    if (st.done) { st.done = false; st.at = null; await saveActive(); render(); return; }
+    if (st.done) {
+      // Unticking is deliberate: it needs a confirmation.
+      const ok = await confirmModal(`Undo set ${j + 1}?`, `${esc(e.nameEn)}: the set goes back to not done. The numbers stay filled in.`, 'Undo set');
+      lastCheckTap = Date.now();
+      if (!ok) return;
+      st.done = false; st.at = null; await saveActive(); render(); return;
+    }
     if (!st.reps || st.reps <= 0) { toast('Enter the reps first.'); main.querySelector(`input.reps[data-ex="${i}"][data-set="${j}"]`)?.focus(); return; }
     st.done = true; st.at = Date.now();
     // Carry this set's numbers into later empty sets (saves typing).
@@ -203,6 +258,7 @@ const actions = {
     const roundDone = members.every((m) => m.sets.length <= j || m.sets[j].done);
     const anyLeft = A.exercises.some((x) => !x.skipped && x.sets.some((s) => !s.done));
     if (roundDone && anyLeft) {
+      hideToast(); // e.g. a stale "Now A2…" hint
       const secs = restForBlock(A, block.idx);
       startRest(secs, nextLabel(A));
     } else if (!roundDone) {
@@ -249,15 +305,14 @@ const actions = {
     const A = state.active;
     const left = A.exercises.reduce((a, e) => a + (e.skipped ? 0 : e.sets.filter((s) => !s.done).length), 0);
     if (left && !(await confirmModal('Finish workout?', `${left} set${left === 1 ? ' is' : 's are'} not ticked. They won’t be saved.`, 'Finish'))) return;
-    timer.stop();
-    const S = { ...A, finishedAt: Date.now() };
-    delete S.rest;
-    state.sessions.push(S);
-    await store.put('sessions', S);
-    state.active = null;
-    await saveActive();
-    keepAwake(false);
-    go(`summary/${S.id}`);
+    await saveFinished(A);
+  },
+  'stale-save': async () => {
+    const A = staleActive();
+    if (!A) { render(); return; }
+    await saveFinished(A, false);
+    toast('Saved as finished.');
+    go('today');
   },
   discard: async () => {
     if (!(await confirmModal('Discard this workout?', 'Nothing from this session will be saved.', 'Discard', true))) return;
@@ -278,14 +333,17 @@ const actions = {
     const f = el.closest('form');
     const v = readCardio(f, 'c-');
     if (!v) return;
-    await addCardio({ kind: formVal(f, 'c-kind'), type: formVal(f, 'c-type'), date: formVal(f, 'c-date') || isoDate(), ...v });
+    const date = pastDate(formVal(f, 'c-date'));
+    if (!date) return;
+    await addCardio({ kind: formVal(f, 'c-kind'), type: formVal(f, 'c-type'), date, ...v });
     render(); toast(`Cardio saved.${talkNote(v.talk)}`);
   },
   'weight-save': async (el) => {
     const f = el.closest('form');
     const kg = parseDecimal(formVal(f, 'bw-kg'));
     if (!kg || Number.isNaN(kg) || kg < 30 || kg > 300) { toast('Enter your weight in kg, e.g. 80,4'); return; }
-    const date = formVal(f, 'bw-date') || isoDate();
+    const date = pastDate(formVal(f, 'bw-date'));
+    if (!date) return;
     await putBody(date, { weightKg: Math.round(kg * 100) / 100 });
     render(); toast('Weight saved.');
   },
@@ -293,7 +351,9 @@ const actions = {
     const f = el.closest('form');
     const cm = parseDecimal(formVal(f, 'w-cm'));
     if (!cm || Number.isNaN(cm) || cm < 40 || cm > 250) { toast('Enter your waist in cm, e.g. 88,5'); return; }
-    await putBody(formVal(f, 'w-date') || isoDate(), { waistCm: Math.round(cm * 10) / 10 });
+    const date = pastDate(formVal(f, 'w-date'));
+    if (!date) return;
+    await putBody(date, { waistCm: Math.round(cm * 10) / 10 });
     render(); toast('Waist saved.');
   },
   'del-cardio': async (el) => { state.cardio = state.cardio.filter((c) => c.id !== el.dataset.id); await store.delete('cardio', el.dataset.id); render(); },
@@ -328,6 +388,20 @@ const actions = {
     else location.reload();
   },
 };
+
+/** Store a workout as finished. The end time is "now", or for a stale
+ *  workout the last ticked set plus its rest (capped, see endTimeFor). */
+async function saveFinished(A, showSummary = true) {
+  timer.stop();
+  const S = { ...A, finishedAt: endTimeFor(A) };
+  delete S.rest;
+  state.sessions.push(S);
+  await store.put('sessions', S);
+  state.active = null;
+  await saveActive();
+  keepAwake(false);
+  if (showSummary) go(`summary/${S.id}`);
+}
 
 function applySwap(e, exId) {
   const x = exercise(exId);
@@ -364,7 +438,7 @@ async function onChange(e) {
   if (t.dataset.setting) {
     const k = t.dataset.setting;
     let v = t.value;
-    if (k === 'startDate') v = v || null;
+    if (k === 'startDate') { v = v || null; if (v && !isISODate(v)) { toast('Pick a valid date.'); render(); return; } }
     if (k === 'deloadEvery') v = Number(v);
     if (k === 'programId') ui.pickDay = null;
     s[k] = v;
@@ -450,6 +524,7 @@ function restDone() {
 }
 function clockTick() {
   if (!state.active) return;
+  if (staleActive() && document.body.dataset.view === 'workout') { timer.stop(); keepAwake(false); render(); return; }
   const el = $('#wk-clock');
   if (el) el.textContent = fmtClock(Date.now() - state.active.startedAt);
 }
@@ -494,7 +569,7 @@ async function importBackup(input) {
   if (!ok) return;
   timer.stop();
   await importData(data);
-  if (state.active && state.active.rest) timer.restore(state.active.rest.endsAt, state.active.rest.total, state.active.rest.label);
+  if (state.active && state.active.rest && !staleActive()) timer.restore(state.active.rest.endsAt, state.active.rest.total, state.active.rest.label);
   ui.pickDay = null; ui.mode = null;
   render(); toast('Backup restored.');
 }

@@ -97,14 +97,14 @@ const EX = {
                         cue: 'Curl the ribs towards the hips; controlled.', subs: ['reverse-crunch'] },
   'hanging-leg-raise':{ nameEn: 'Hanging leg raise', nameEs: 'Elevación de piernas colgado', muscles: ['Abs'], equipment: 'bodyweight',
                         cue: "If your grip gives out first, use a captain's chair raise or a reverse crunch.", subs: ['captains-chair', 'reverse-crunch'] },
-  'captains-chair':   { nameEn: "Captain's chair leg raise", nameEs: 'Elevación de piernas en silla', muscles: ['Abs'], equipment: 'bodyweight',
+  'captains-chair':   { nameEn: "Captain's chair leg raise", nameEs: 'Elevación de piernas en silla romana', muscles: ['Abs'], equipment: 'bodyweight',
                         cue: 'Same job as the hanging raise without the grip limit.', subs: ['hanging-leg-raise', 'reverse-crunch'] },
   'reverse-crunch':   { nameEn: 'Reverse crunch', nameEs: 'Crunch inverso', muscles: ['Abs'], equipment: 'bodyweight',
                         cue: 'Roll the hips up off the bench; slow on the way down.', subs: ['hanging-leg-raise'] },
 };
 
 export function exercise(id) {
-  const e = EX[id];
+  const e = isExerciseId(id) ? EX[id] : null;
   return e ? { id, perSide: false, ...e } : null;
 }
 export const EXERCISE_IDS = Object.keys(EX);
@@ -181,7 +181,7 @@ const DAYS = {
   fullC: { name: 'Full C', nameEs: 'Día 3 – Full C', leg: true, slots: [
     s('hip-thrust',        3, 8, 10,  'C', 'core',     120, null, RAMP),
     s('db-shoulder-press', 3, 8, 10,  'C', 'core',      90, 'A', RAMP),
-    s('lat-pulldown',      3, 10, 12, 'C', 'core',      90, 'A', RAMP),
+    s('lat-pulldown',      3, 10, 12, 'C', 'core',      90, 'A', { rampUp: true, extraSubs: ['cable-row'] }),
     s('leg-ext',           2, 10, 15, 'I', 'core',      90, 'B'),
     s('seated-leg-curl',   2, 10, 12, 'I', 'core',      90, 'B'),
     s('lateral-raise',     2, 12, 15, 'I', 'optional',  60),
@@ -207,7 +207,9 @@ export function getDay(dayId) {
   if (!d) return null;
   const slots = d.slots.map((sl, i) => {
     const ex = exercise(sl.exId);
-    return { slotId: `${dayId}-${i}`, ...sl, ...ex, id: sl.exId };
+    // Slot-specific alternatives (e.g. Full C pull: pulldown or cable row, review 5.7).
+    const subs = [...ex.subs, ...(sl.extraSubs || [])].filter((v, k, a) => a.indexOf(v) === k);
+    return { slotId: `${dayId}-${i}`, ...sl, ...ex, subs, id: sl.exId };
   });
   return { id: dayId, ...d, slots };
 }
@@ -216,6 +218,8 @@ export function dayName(dayId) {
   return d ? d.name : dayId;
 }
 export function allDayIds() { return Object.keys(DAYS); }
+export function isDayId(id) { return typeof id === 'string' && Object.prototype.hasOwnProperty.call(DAYS, id); }
+export function isExerciseId(id) { return typeof id === 'string' && Object.prototype.hasOwnProperty.call(EX, id); }
 
 /* ------------------------------------------------------------------ */
 /* Effort: ramp-up, RIR and deload (review §2, §5.4, §5.6)              */
@@ -223,7 +227,7 @@ export function allDayIds() { return Object.keys(DAYS); }
 
 /** Program week from the start date: 1 = first week. 0 = not started / unset. */
 export function programWeek(startISO, todayISO) {
-  if (!startISO) return 0;
+  if (!startISO || !/^\d{4}-\d{2}-\d{2}$/.test(startISO)) return 0;
   const a = Date.UTC(...isoParts(startISO));
   const b = Date.UTC(...isoParts(todayISO));
   const days = Math.round((b - a) / 86400000);
@@ -239,6 +243,14 @@ export function isDeload(settings, week) {
   if (o === true || o === false) return o;
   const every = Number(settings.deloadEvery) || 7;
   return week % every === 0;
+}
+
+/** Min–max total minutes over a program's days for a mode (labels like "Short ≈31–40 min"). */
+export function estimateRange(programId, opts) {
+  const p = PROGRAMS[programId] || PROGRAMS.four;
+  const t = p.rotation.map((d) => estimate(getDay(d), opts).total);
+  const lo = Math.min(...t), hi = Math.max(...t);
+  return lo === hi ? `${lo}` : `${lo}–${hi}`;
 }
 
 /** Short phase description shown on Today. */

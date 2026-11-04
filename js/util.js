@@ -49,11 +49,17 @@ export function parseIntSafe(str) {
   const n = parseDecimal(str);
   return n === null || Number.isNaN(n) ? n : Math.round(n);
 }
-/** 62.5 -> "62.5", 60 -> "60". */
+/** Decimal separator of the phone's language ("," on a Spanish iPhone). */
+export const DECIMAL = (() => {
+  try { return new Intl.NumberFormat(navigator.language || 'en').format(1.5).includes(',') ? ',' : '.'; } catch { return '.'; }
+})();
+/** 62.5 -> "62.5" (or "62,5" on a comma locale), 60 -> "60". Never throws. */
 export function fmtNum(n, maxDec = 1) {
-  if (n === null || n === undefined || Number.isNaN(n)) return '—';
-  return String(Math.round(n * 10 ** maxDec) / 10 ** maxDec);
+  if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
+  const s = String(Math.round(n * 10 ** maxDec) / 10 ** maxDec);
+  return DECIMAL === ',' ? s.replace('.', ',') : s;
 }
+export const isISODate = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v));
 export function fmtClock(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;

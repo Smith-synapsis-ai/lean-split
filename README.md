@@ -14,8 +14,8 @@ companion: lose fat, keep the muscle, about an hour in the gym, then get on with
 The installed app has its own storage, separate from Safari. Log from the icon, not from a Safari tab.
 
 ## What it does
-- **Today**: the session for today (or a rest day), Full (~60 min) or Short (~45 min) with a live time
-  estimate, the target RIR for this program week, deload reminders, an optional morning-walk log and a
+- **Today**: the session for today (or a rest day), Full (about 50–60 min) or Short (about 30–40 min) with a
+  live time estimate, the target RIR for this program week, deload reminders, an optional morning-walk log and a
   weekly cardio meter.
 - **Workout**: exercise cards in order with supersets grouped, weight × reps prefilled from last time,
   a rest timer that starts on ✓ (after the pair in a superset), +30 s / Skip, a beep and a screen flash,
@@ -51,6 +51,12 @@ Plain HTML, CSS and JavaScript ES modules: no build step, no frameworks, no CDN.
 ### Releasing a change
 Bump `VERSION` in `sw.js` **and** `APP_VERSION` in `js/version.js` (keep them equal), then push to `main`.
 Open apps show **"Update available. Tap to refresh"** the next time they come to the foreground.
+
+### Robustness
+- An unfinished workout older than 4 hours (or from an earlier day) is not resumed silently: Today offers
+  "Save as finished" (ending after the last ticked set and its rest) or "Discard". Durations are capped at 4 h.
+- Imported backups are validated deeply (types, ranges, known exercises and days); stored data is
+  sanitised on load, and a screen that still fails shows a recovery card instead of hanging.
 
 ### Known iOS limits
 No vibration API on iOS; web apps can't schedule local notifications, so the rest alert (beep + flash)

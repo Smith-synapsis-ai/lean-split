@@ -2,7 +2,25 @@
 // weight trends and weekly summaries. No DOM here, so it is easy to test.
 import { addDays, mondayOf, fmtNum, daysBetween } from './util.js';
 
-const doneSets = (ex) => (ex && !ex.skipped ? ex.sets.filter((s) => s.done && s.reps > 0) : []);
+const doneSets = (ex) => (ex && !ex.skipped && Array.isArray(ex.sets) ? ex.sets.filter((s) => s && s.done && s.reps > 0) : []);
+
+/** Session length in minutes, capped at 4 h as a safety net (no 900-minute sessions). */
+export const MAX_SESSION_MIN = 240;
+export function durationMin(s) {
+  const m = Math.round(((s.finishedAt ?? Date.now()) - s.startedAt) / 60000);
+  return Number.isFinite(m) ? Math.max(0, Math.min(MAX_SESSION_MIN, m)) : 0;
+}
+/** Time of the last activity in a workout: the last ticked set, or the start. */
+export function lastActivity(w) {
+  let t = w.startedAt || 0;
+  for (const e of w.exercises || []) for (const st of e.sets || []) if (st && st.done && st.at > t) t = st.at;
+  return t;
+}
+/** A workout is stale if it began on an earlier day or saw no activity for 4 h. */
+export const STALE_MS = 4 * 3600 * 1000;
+export function isStale(w, todayISO, now = Date.now()) {
+  return !!w && (w.date !== todayISO || now - lastActivity(w) > STALE_MS);
+}
 const finished = (sessions) => sessions.filter((s) => s.finishedAt).sort((a, b) => a.startedAt - b.startedAt);
 
 /** Most recent finished performance of an exercise (optionally before a time). */
@@ -89,14 +107,17 @@ export function findPRs(session, sessions) {
 }
 
 /* ---------------- Body weight ---------------- */
-function weights(body) { return body.filter((b) => typeof b.weightKg === 'number').sort((a, b) => (a.date < b.date ? -1 : 1)); }
+function weights(body, upTo = null) {
+  return body.filter((b) => b && typeof b.weightKg === 'number' && Number.isFinite(b.weightKg) && (!upTo || b.date <= upTo))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+}
 function meanIn(list, from, to) {
   const v = list.filter((b) => b.date >= from && b.date <= to).map((b) => b.weightKg);
   return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
 }
 /** Each weigh-in with the average of all weigh-ins in the 7 days ending that day. */
-export function rollingAverage(body) {
-  const w = weights(body);
+export function rollingAverage(body, upTo = null) {
+  const w = weights(body, upTo);
   return w.map((b) => ({ date: b.date, kg: b.weightKg, avg7: meanIn(w, addDays(b.date, -6), b.date) }));
 }
 /**
@@ -104,7 +125,7 @@ export function rollingAverage(body) {
  * weight, against the 0.5–0.7 %/week loss band (review §6/§8).
  */
 export function weeklyChange(body, today) {
-  const w = weights(body);
+  const w = weights(body, today);
   const avgNow = meanIn(w, addDays(today, -6), today);
   const avgPrev = meanIn(w, addDays(today, -13), addDays(today, -7));
   if (avgNow === null) return { avgNow, avgPrev, pct: null, status: 'none', message: 'Log a few morning weigh-ins this week to see your 7-day average.' };
@@ -114,19 +135,21 @@ export function weeklyChange(body, today) {
   let status, message;
   if (loss > 0.7) { status = 'fast'; message = 'Losing faster than the 0.5–0.7 % band. Eat a bit more (mostly carbs) so you keep your strength and muscle.'; }
   else if (loss >= 0.5) { status = 'on'; message = 'Right in the 0.5–0.7 % band. You are on track.'; }
-  else { status = 'slow'; message = 'Slower than the band. That is fine: be patient, weekly averages wobble. Check again next week.'; }
+  else if (loss > 0) { status = 'slow'; message = 'Slower than the band. That is fine: be patient, weekly averages wobble. Check again next week.'; }
+  else if (loss < 0) { status = 'up'; message = 'Trending up this week. That is usually normal day-to-day noise (water, salt, carbs). If it continues for 2+ weeks, trim portions a little.'; }
+  else { status = 'flat'; message = 'Holding steady this week. Fine for a week or two; if it stays flat for 2+ weeks, trim portions a little.'; }
   return { avgNow, avgPrev, pct, status, message };
 }
 
 /* ---------------- Weeks, cardio, summaries ---------------- */
 export function cardioMinutes(cardio, from, to) {
-  return cardio.filter((c) => c.date >= from && c.date <= to).reduce((a, c) => a + (Number(c.minutes) || 0), 0);
+  return cardio.filter((c) => c && c.date >= from && c.date <= to).reduce((a, c) => a + (Number(c.minutes) || 0), 0);
 }
 export function sessionsBetween(sessions, from, to) {
   return finished(sessions).filter((s) => s.date >= from && s.date <= to);
 }
 export function setsDone(session) { return session.exercises.reduce((a, e) => a + doneSets(e).length, 0); }
-export function setsPlanned(session) { return session.exercises.reduce((a, e) => a + (e.skipped ? 0 : e.sets.length), 0); }
+export function setsPlanned(session) { return session.exercises.reduce((a, e) => a + (e.skipped || !Array.isArray(e.sets) ? 0 : e.sets.length), 0); }
 
 /** Summaries for the last n weeks (newest first), Monday to Sunday. */
 export function weeklySummaries(state, today, n = 8) {
@@ -153,7 +176,7 @@ export function liftTrend(sessions, exId) {
   return finished(sessions).map((s) => {
     const ex = s.exercises.find((e) => e.exId === exId);
     const t = ex ? topSet(doneSets(ex)) : null;
-    return t && t.kg ? { date: s.date, y: t.kg, reps: t.reps } : null;
+    return t && typeof t.kg === 'number' && t.kg > 0 ? { date: s.date, y: t.kg, reps: t.reps } : null;
   }).filter(Boolean);
 }
 
